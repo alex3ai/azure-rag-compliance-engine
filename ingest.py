@@ -11,37 +11,43 @@ Pipeline de Ingestão RAG Auditável
 import os
 import hashlib
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
-from dataclasses import dataclass, asdict
-import time
+from dataclasses import dataclass
 
-# Bibliotecas necessárias (instalar com: pip install -r requirements.txt)
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import AzureOpenAIEmbeddings
-from azure.search.documents import SearchClient
-from azure.search.documents.indexes import SearchIndexClient
-from azure.search.documents.indexes.models import (
-    SimpleField,
-    SearchableField,
-    SearchField,
-    SearchFieldDataType,
-    VectorSearch,
-    HnswAlgorithmConfiguration,
-    VectorSearchProfile,
-    SemanticConfiguration,
-    SemanticField,
-    SemanticPrioritizedFields,
-    SemanticSearch,
-    SearchIndex
-)
-from azure.core.credentials import AzureKeyCredential
-from dotenv import load_dotenv
-from tqdm import tqdm
+# --- IMPORTAÇÕES CORRIGIDAS ---
+try:
+    from dotenv import load_dotenv
+    from tqdm import tqdm
+    from langchain_community.document_loaders import PyPDFLoader
+    # CORREÇÃO AQUI: Importação do pacote específico de text-splitters
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_openai import AzureOpenAIEmbeddings
+    from azure.search.documents import SearchClient
+    from azure.search.documents.indexes import SearchIndexClient
+    from azure.search.documents.indexes.models import (
+        SimpleField,
+        SearchableField,
+        SearchField,
+        SearchFieldDataType,
+        VectorSearch,
+        HnswAlgorithmConfiguration,
+        VectorSearchProfile,
+        SemanticConfiguration,
+        SemanticField,
+        SemanticPrioritizedFields,
+        SemanticSearch,
+        SearchIndex
+    )
+    from azure.core.credentials import AzureKeyCredential
+except ImportError as e:
+    print(f"❌ Erro de importação: {e}")
+    print("Execute: pip install langchain-community langchain-text-splitters langchain-openai azure-search-documents azure-identity python-dotenv tqdm pypdf")
+    exit(1)
 
-# Carregar variáveis de ambiente
+# Carregar variáveis de ambiente do arquivo .env
 load_dotenv()
 
 # ==================== CONFIGURAÇÕES ====================
@@ -59,7 +65,7 @@ class Config:
     search_key: str = os.getenv("AZURE_SEARCH_KEY")
     index_name: str = os.getenv("AZURE_SEARCH_INDEX_NAME", "compliance-docs-index")
     
-    # Chunking (otimizado baseado em boas práticas 2025)
+    # Chunking (otimizado baseado em boas práticas)
     chunk_size: int = 1000  # Caracteres
     chunk_overlap: int = 200  # 20% overlap para contexto
     
@@ -82,7 +88,7 @@ class Config:
         
         missing = [k for k, v in required.items() if not v]
         if missing:
-            raise ValueError(f"❌ Variáveis de ambiente faltando: {', '.join(missing)}")
+            raise ValueError(f"❌ Variáveis de ambiente faltando no arquivo .env: {', '.join(missing)}")
         
         # Criar diretório de cache
         if self.use_cache:
@@ -150,16 +156,13 @@ class ChunkQualityValidator:
             return False, "Chunk vazio"
         
         # 3. Verificar se tem conteúdo significativo (não só números/símbolos)
-        alphanumeric_ratio = sum(c.isalnum() for c in text) / len(text)
+        alphanumeric_ratio = sum(c.isalnum() for c in text) / len(text) if len(text) > 0 else 0
         if alphanumeric_ratio < 0.5:
             return False, f"Baixo conteúdo significativo ({alphanumeric_ratio:.1%})"
         
-        # 4. Verificar se não está truncado no meio de uma frase
-        # (Ideal: termina com pontuação)
-        last_char = text.strip()[-1]
-        if last_char not in '.!?;:':
-            # Warning, mas não invalida
-            pass
+        # 4. Verificar truncamento (Opcional - apenas warning)
+        # last_char = text.strip()[-1]
+        # if last_char not in '.!?;:': pass
         
         return True, "OK"
 
@@ -250,6 +253,9 @@ class DocumentProcessor:
     def __init__(self, config: Config, cache_manager: CacheManager):
         self.config = config
         self.cache = cache_manager
+        
+        # Inicializa Embeddings
+        print(f"🔌 Conectando ao Azure OpenAI Embeddings ({config.embedding_deployment})...")
         self.embeddings = AzureOpenAIEmbeddings(
             azure_deployment=config.embedding_deployment,
             openai_api_version=config.openai_api_version,
@@ -262,14 +268,7 @@ class DocumentProcessor:
             chunk_size=config.chunk_size,
             chunk_overlap=config.chunk_overlap,
             length_function=len,
-            separators=[
-                "\n\n",  # Parágrafos
-                "\n",    # Linhas
-                ". ",    # Sentenças
-                ", ",    # Cláusulas
-                " ",     # Palavras
-                ""       # Caracteres
-            ],
+            separators=["\n\n", "\n", ". ", ", ", " ", ""],
             keep_separator=True
         )
         
@@ -280,11 +279,14 @@ class DocumentProcessor:
         
         print(f"\n📄 Processando: {os.path.basename(pdf_path)}")
         
-        # 1. Carregar PDF
-        loader = PyPDFLoader(pdf_path)
-        pages = loader.load()
-        
-        print(f"   📑 {len(pages)} páginas carregadas")
+        try:
+            # 1. Carregar PDF
+            loader = PyPDFLoader(pdf_path)
+            pages = loader.load()
+            print(f"   📑 {len(pages)} páginas carregadas")
+        except Exception as e:
+            print(f"   ❌ Erro ao ler PDF: {e}")
+            return []
         
         # 2. Hash do arquivo para tracking
         with open(pdf_path, 'rb') as f:
@@ -309,7 +311,7 @@ class DocumentProcessor:
                         "page_number": page.metadata.get('page', 0),
                         "chunk_index": chunk_idx,
                         "compliance_level": "CONFIDENTIAL",  # Configurável
-                        "indexed_at": datetime.now().isoformat(),
+                        "indexed_at": datetime.now().isoformat() + "Z",
                         "file_hash": file_hash,
                         "chunk_quality_score": 1.0,  # Pode ser refinado
                     }
@@ -317,7 +319,8 @@ class DocumentProcessor:
                     valid_chunks += 1
                 else:
                     invalid_chunks += 1
-                    print(f"   ⚠️ Chunk inválido (página {page.metadata.get('page')}): {reason}")
+                    # Opcional: printar apenas se quiser debug detalhado
+                    # print(f"   ⚠️ Chunk inválido: {reason}")
         
         print(f"   ✅ {valid_chunks} chunks válidos | ❌ {invalid_chunks} chunks rejeitados")
         
@@ -326,6 +329,9 @@ class DocumentProcessor:
     def generate_embeddings_batch(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Gera embeddings em batches com cache"""
         
+        if not chunks:
+            return []
+            
         print(f"\n🧮 Gerando embeddings para {len(chunks)} chunks...")
         
         enriched_chunks = []
@@ -344,13 +350,17 @@ class DocumentProcessor:
                     chunk['content_vector'] = cached_emb
                     cache_hits += 1
                 else:
-                    # Chamar API
-                    embedding = self.embeddings.embed_query(chunk['content'])
-                    chunk['content_vector'] = embedding
-                    
-                    # Salvar no cache
-                    self.cache.save_embedding(chunk['content'], embedding)
-                    api_calls += 1
+                    try:
+                        # Chamar API
+                        embedding = self.embeddings.embed_query(chunk['content'])
+                        chunk['content_vector'] = embedding
+                        
+                        # Salvar no cache
+                        self.cache.save_embedding(chunk['content'], embedding)
+                        api_calls += 1
+                    except Exception as e:
+                        print(f"❌ Erro na API de Embeddings: {e}")
+                        continue
                 
                 # ID único
                 chunk['id'] = f"{chunk['file_hash']}_{chunk['page_number']}_{chunk['chunk_index']}"
@@ -370,6 +380,10 @@ class DocumentProcessor:
 def index_documents(config: Config, chunks: List[Dict[str, Any]]):
     """Indexa chunks no Azure AI Search"""
     
+    if not chunks:
+        print("⚠️ Nenhum chunk para indexar.")
+        return
+
     print(f"\n📤 Indexando {len(chunks)} chunks no Azure AI Search...")
     
     search_client = SearchClient(
@@ -407,28 +421,36 @@ def main():
     print("="*60)
     
     # 1. Configuração
-    config = Config()
-    config.validate()
+    try:
+        config = Config()
+        config.validate()
+    except Exception as e:
+        print(f"❌ Erro de Configuração: {e}")
+        return
     
     cache_manager = CacheManager(config.cache_dir)
-    processor = DocumentProcessor(config, cache_manager)
+    try:
+        processor = DocumentProcessor(config, cache_manager)
+    except Exception as e:
+        print(f"❌ Erro ao inicializar Processador: {e}")
+        return
     
     # 2. Criar/Atualizar índice
     create_or_update_index(config)
     
     # 3. Processar documentos
-    # EXEMPLO: Coloque seus PDFs em uma pasta 'documents/'
     documents_dir = Path("documents")
     
     if not documents_dir.exists():
-        print(f"\n⚠️ Crie a pasta '{documents_dir}' e adicione seus PDFs")
+        print(f"\n⚠️ Pasta '{documents_dir}' não encontrada. Criando...")
         documents_dir.mkdir()
+        print(f"➡️ Por favor, coloque seus arquivos PDF dentro da pasta '{documents_dir}' e execute novamente.")
         return
     
     pdf_files = list(documents_dir.glob("*.pdf"))
     
     if not pdf_files:
-        print(f"\n⚠️ Nenhum PDF encontrado em '{documents_dir}'")
+        print(f"\n⚠️ Nenhum PDF encontrado em '{documents_dir}'. Adicione arquivos e tente novamente.")
         return
     
     print(f"\n📚 Encontrados {len(pdf_files)} PDFs para processar")
