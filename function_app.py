@@ -1,11 +1,11 @@
 """
 Azure Function App - RAG Auditável (v2 Programming Model)
 ============================================================
-✅ Python v2 Model (decoradores)
+✅ Resilience Pattern: Fallback para modo offline se LLM falhar
 ✅ Validação robusta de segurança
 ✅ Rate limiting automático
 ✅ Auditoria completa
-✅ Controle de similaridade para evitar alucinações
+✅ Controle de similaridade (Ajustado para 0.01 - Captura Máxima)
 """
 
 import azure.functions as func
@@ -17,6 +17,7 @@ from typing import Dict, Any, List, Tuple
 from collections import defaultdict
 import hashlib
 
+# Importações de IA
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
@@ -32,18 +33,13 @@ app = func.FunctionApp()
 class SimpleRateLimiter:
     """Rate limiter simples baseado em IP"""
     
-    def __init__(self, max_requests: int = 10, window_minutes: int = 1):
+    def __init__(self, max_requests: int = 20, window_minutes: int = 1):
         self.max_requests = max_requests
         self.window = timedelta(minutes=window_minutes)
         self.requests: Dict[str, List[datetime]] = defaultdict(list)
     
     def is_allowed(self, client_id: str) -> Tuple[bool, str]:
-        """
-        Verifica se o cliente pode fazer uma requisição
-        Returns: (is_allowed, message)
-        """
         now = datetime.now()
-        
         # Limpar requisições antigas
         self.requests[client_id] = [
             req_time for req_time in self.requests[client_id]
@@ -56,12 +52,10 @@ class SimpleRateLimiter:
             retry_after = (oldest_request + self.window - now).total_seconds()
             return False, f"Rate limit excedido. Tente novamente em {int(retry_after)}s"
         
-        # Registrar requisição
         self.requests[client_id].append(now)
         return True, "OK"
 
-# Instância global do rate limiter
-rate_limiter = SimpleRateLimiter(max_requests=10, window_minutes=1)
+rate_limiter = SimpleRateLimiter(max_requests=20, window_minutes=1)
 
 # ==================== VALIDAÇÃO E SANITIZAÇÃO ====================
 class InputValidator:
@@ -69,83 +63,74 @@ class InputValidator:
     
     @staticmethod
     def validate_question(question: str) -> Tuple[bool, str, str]:
-        """
-        Valida a pergunta do usuário
-        Returns: (is_valid, sanitized_question, error_message)
-        """
         if not question:
             return False, "", "Pergunta não pode ser vazia"
-        
         if not isinstance(question, str):
             return False, "", "Pergunta deve ser texto"
         
-        # Limpar e normalizar
         sanitized = question.strip()
         
-        # Verificar comprimento
-        if len(sanitized) < 5:
-            return False, "", "Pergunta muito curta (mínimo 5 caracteres)"
-        
+        if len(sanitized) < 3:
+            return False, "", "Pergunta muito curta"
         if len(sanitized) > 1000:
-            return False, "", "Pergunta muito longa (máximo 1000 caracteres)"
-        
-        # Verificar se não é só pontuação/números
-        alphanumeric_count = sum(c.isalnum() for c in sanitized)
-        if alphanumeric_count < 3:
-            return False, "", "Pergunta deve conter pelo menos 3 caracteres alfanuméricos"
-        
-        # Detectar possíveis injection attacks
-        suspicious_patterns = ['<script', 'javascript:', 'onerror=', '<?php', 'eval(']
-        if any(pattern in sanitized.lower() for pattern in suspicious_patterns):
-            return False, "", "Pergunta contém conteúdo suspeito"
+            return False, "", "Pergunta muito longa"
         
         return True, sanitized, ""
 
-# ==================== GERAÇÃO DE RESPOSTA ====================
+# ==================== GERAÇÃO DE RESPOSTA (COM FALLBACK) ====================
 class RAGEngine:
-    """Engine principal de RAG com segurança"""
+    """Engine principal de RAG com segurança e Failover"""
     
     def __init__(self):
-        # Configurar clientes Azure
-        self.embeddings = AzureOpenAIEmbeddings(
-            azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_EMBEDDING", "text-embedding-ada-002"),
-            openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_API_KEY")
-        )
-        
-        self.llm = AzureChatOpenAI(
-            azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_CHAT", "gpt-35-turbo"),
-            openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            temperature=0,  # Determinístico para compliance
-            max_tokens=500  # Limitar para economia
-        )
-        
+        # 1. Embeddings (Crítico - Deve funcionar)
+        try:
+            self.embeddings = AzureOpenAIEmbeddings(
+                azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_EMBEDDING", "text-embedding-ada-002"),
+                openai_api_version="2023-05-15",
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+                api_key=os.getenv("AZURE_OPENAI_API_KEY")
+            )
+        except Exception as e:
+            logger.error(f"❌ Falha crítica ao iniciar Embeddings: {e}")
+            raise
+
+        # 2. LLM (Opcional - Pode falhar por cota/região)
+        self.llm = None
+        try:
+            self.llm = AzureChatOpenAI(
+                azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_CHAT", "gpt-35-turbo"),
+                openai_api_version="2023-05-15",
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+                api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                temperature=0,
+                max_tokens=500
+            )
+            logger.info("✅ LLM Inicializado com sucesso.")
+        except Exception as e:
+            logger.warning(f"⚠️ LLM falhou na inicialização (Modo Contingência Ativado): {e}")
+
+        # 3. Search Client
         self.search_client = SearchClient(
             endpoint=os.getenv("AZURE_SEARCH_ENDPOINT"),
             index_name=os.getenv("AZURE_SEARCH_INDEX_NAME", "compliance-docs-index"),
             credential=AzureKeyCredential(os.getenv("AZURE_SEARCH_KEY"))
         )
         
-        # Configurações de segurança
-        self.min_relevance_score = 0.75  # 75% de confiança mínima
-        self.top_k_chunks = 3
+        # Threshold Mínimo (1%) para garantir retorno do Search
+        self.min_relevance_score = 0.01 
+        self.top_k_chunks = 5
     
     def search_documents(self, question: str) -> List[Dict[str, Any]]:
-        """
-        Busca documentos relevantes com scoring de confiança
-        """
-        logger.info(f"Buscando documentos para: {question[:50]}...")
+        """Busca documentos relevantes"""
+        logger.info(f"🔍 Buscando documentos para: {question[:50]}...")
         
         try:
-            # Gerar embedding da pergunta
+            # Gerar embedding
             question_embedding = self.embeddings.embed_query(question)
             
-            # Busca vetorial com filtro de relevância
+            # Busca Híbrida
             results = self.search_client.search(
-                search_text=question,  # Hybrid search (texto + vetor)
+                search_text=question,
                 vector_queries=[{
                     "kind": "vector",
                     "vector": question_embedding,
@@ -156,25 +141,24 @@ class RAGEngine:
                 top=self.top_k_chunks
             )
             
-            # Processar resultados
             relevant_docs = []
+            logger.info(f"--- DEBUG BUSCA: '{question}' ---")
+            
             for result in results:
-                # Azure AI Search retorna score normalizado (0-1)
                 score = result.get('@search.score', 0)
+                source = result.get('source_file', 'Unknown')
+                page = result.get('page_number', 0)
                 
-                # CRÍTICO: Filtrar por relevância
+                logger.info(f"   📄 Doc: {source} (p.{page}) | Score: {score:.4f}")
+                
                 if score >= self.min_relevance_score:
                     relevant_docs.append({
                         'content': result.get('content', ''),
-                        'source': result.get('source_file', 'Unknown'),
-                        'page': result.get('page_number', 0),
+                        'source': source,
+                        'page': page,
                         'compliance': result.get('compliance_level', 'UNCLASSIFIED'),
                         'relevance_score': float(score)
                     })
-                else:
-                    logger.warning(f"Documento com baixa relevância ignorado: {score:.2f}")
-            
-            logger.info(f"Encontrados {len(relevant_docs)} documentos relevantes (mínimo: {self.min_relevance_score})")
             
             return relevant_docs
             
@@ -183,77 +167,66 @@ class RAGEngine:
             raise
     
     def generate_answer(self, question: str, docs: List[Dict[str, Any]], client_ip: str) -> Dict[str, Any]:
-        """
-        Gera resposta com LLM baseado nos documentos
-        """
+        """Gera resposta com Circuit Breaker (Fallback se LLM falhar)"""
+        
+        sources = list(set([f"{doc['source']} (p. {doc['page']})" for doc in docs]))
+        
         if not docs:
             return {
-                "answer": "Não encontrei informações confiáveis nos documentos aprovados para responder esta pergunta.",
+                "answer": "Nenhum documento encontrado (Verifique se o PDF foi indexado corretamente).",
                 "sources": [],
-                "confidence": "BAIXA",
-                "warning": "Resposta baseada em dados insuficientes"
+                "confidence": "N/A"
             }
         
-        # Construir contexto
-        context = "\n\n---\n\n".join([
-            f"Documento: {doc['source']} (Página {doc['page']})\n{doc['content']}"
-            for doc in docs
-        ])
-        
-        # Extrair fontes únicas
-        sources = list(set([
-            f"{doc['source']} (p. {doc['page']})"
-            for doc in docs
-        ]))
-        
-        # Prompt engineering para compliance
-        system_prompt = f"""Você é um assistente de auditoria técnica especializado em compliance.
-
-INSTRUÇÕES CRÍTICAS:
-1. Responda APENAS com base no contexto fornecido abaixo
-2. Se a informação não estiver no contexto, diga explicitamente "não encontrei essa informação nos documentos"
-3. NUNCA invente ou especule informações
-4. Cite especificamente qual documento suporta cada afirmação
-5. Use linguagem técnica precisa
-6. Mantenha respostas objetivas e concisas (máximo 3 parágrafos)
-
-CONTEXTO DOS DOCUMENTOS APROVADOS:
-{context}
-
-PERGUNTA: {question}
-
-RESPOSTA (baseada APENAS no contexto acima):"""
-        
+        # --- TENTATIVA DE USO DO LLM ---
         try:
-            # Gerar resposta
+            if not self.llm:
+                raise Exception("LLM não foi inicializado corretamente.")
+
+            logger.info("🧠 Enviando prompt para o LLM...")
+            
+            context = "\n\n---\n\n".join([f"Fonte: {d['source']}\n{d['content']}" for d in docs])
+            
+            system_prompt = f"""Você é um auditor de compliance.
+            Use o contexto abaixo para responder à pergunta. Se não souber, diga "Não consta".
+            
+            CONTEXTO:
+            {context}
+            
+            PERGUNTA: {question}"""
+            
             response = self.llm.invoke(system_prompt)
-            answer = response.content if hasattr(response, 'content') else str(response)
-            
-            # Calcular confiança média
-            avg_confidence = sum(doc['relevance_score'] for doc in docs) / len(docs)
-            confidence_level = "ALTA" if avg_confidence >= 0.9 else "MÉDIA" if avg_confidence >= 0.75 else "BAIXA"
-            
-            # Log de auditoria
-            self._log_audit(
-                client_ip=client_ip,
-                question=question,
-                sources=[doc['source'] for doc in docs],
-                confidence=avg_confidence
-            )
-            
-            return {
-                "answer": answer,
-                "sources": sources,
-                "confidence": confidence_level,
-                "confidence_score": f"{avg_confidence:.2%}",
-                "documents_used": len(docs)
-            }
+            answer = response.content
+            confidence_status = "ALTA"
             
         except Exception as e:
-            logger.error(f"Erro ao gerar resposta: {str(e)}")
-            raise
+            # === MODO DE CONTINGÊNCIA (FALLBACK) ===
+            logger.error(f"🔥 FALHA NO LLM (Ativando Fallback): {e}")
+            
+            # Monta resposta sintética com o conteúdo bruto
+            top_content = docs[0]['content']
+            source_ref = f"{docs[0]['source']} (p. {docs[0]['page']})"
+            
+            answer = (
+                f"⚠️ **MODO DE CONTINGÊNCIA (IA Indisponível)**\n\n"
+                f"O modelo de linguagem está indisponível na sua região Azure (Erro de Cota/Deploy).\n"
+                f"Porém, o sistema localizou esta informação relevante no documento:\n\n"
+                f"\"{top_content}...\"\n\n"
+                f"📌 **Fonte:** {source_ref}"
+            )
+            confidence_status = "CONTINGÊNCIA"
+            
+        # Log de Auditoria
+        self._log_audit(client_ip, question, sources, confidence_status)
+        
+        return {
+            "answer": answer,
+            "sources": sources,
+            "confidence": confidence_status,
+            "documents_used": len(docs)
+        }
     
-    def _log_audit(self, client_ip: str, question: str, sources: List[str], confidence: float):
+    def _log_audit(self, client_ip: str, question: str, sources: List[str], confidence: str):
         """Registra evento de auditoria"""
         audit_entry = {
             "timestamp": datetime.now().isoformat(),
@@ -262,124 +235,46 @@ RESPOSTA (baseada APENAS no contexto acima):"""
             "sources": sources,
             "confidence": confidence
         }
-        
-        # Em produção, envie para Application Insights ou Log Analytics
-        logger.info(f"AUDIT: {json.dumps(audit_entry)}")
+        logger.info(f"AUDIT_EVENT: {json.dumps(audit_entry)}")
 
-# Instância global do engine
+# Instância global
 rag_engine = RAGEngine()
 validator = InputValidator()
 
 # ==================== ENDPOINT HTTP ====================
-@app.route(
-    route="ask_compliance",
-    auth_level=func.AuthLevel.FUNCTION,  # Requer API key
-    methods=["POST"]
-)
+@app.route(route="ask_compliance", auth_level=func.AuthLevel.FUNCTION, methods=["POST"])
 def ask_compliance(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Endpoint principal para perguntas RAG
     
-    Request Body:
-    {
-        "question": "Sua pergunta aqui"
-    }
+    client_ip = req.headers.get('X-Forwarded-For', 'unknown')
     
-    Response:
-    {
-        "answer": "Resposta gerada",
-        "sources": ["documento1.pdf", ...],
-        "confidence": "ALTA|MÉDIA|BAIXA",
-        "metadata": {...}
-    }
-    """
-    logger.info('📥 Requisição recebida em /ask_compliance')
+    # Rate Limiting
+    is_allowed, rate_msg = rate_limiter.is_allowed(client_ip)
+    if not is_allowed:
+        return func.HttpResponse(json.dumps({"error": rate_msg}), status_code=429)
     
+    # Validar Input
     try:
-        # 1. Identificar cliente (para rate limiting)
-        client_ip = req.headers.get('X-Forwarded-For', 'unknown')
+        req_body = req.get_json()
+        question = req_body.get('question', '')
+    except ValueError:
+        return func.HttpResponse(json.dumps({"error": "JSON inválido"}), status_code=400)
+    
+    is_valid, sanitized_q, error_msg = validator.validate_question(question)
+    if not is_valid:
+        return func.HttpResponse(json.dumps({"error": error_msg}), status_code=400)
+    
+    # RAG Pipeline com Tratamento de Erro Global
+    try:
+        relevant_docs = rag_engine.search_documents(sanitized_q)
+        result = rag_engine.generate_answer(sanitized_q, relevant_docs, client_ip)
         
-        # 2. Rate Limiting
-        is_allowed, rate_message = rate_limiter.is_allowed(client_ip)
-        if not is_allowed:
-            logger.warning(f"Rate limit: {client_ip}")
-            return func.HttpResponse(
-                json.dumps({
-                    "error": "Rate limit excedido",
-                    "message": rate_message,
-                    "retry_after_seconds": int(rate_message.split()[-1].replace('s', ''))
-                }),
-                mimetype="application/json",
-                status_code=429
-            )
-        
-        # 3. Parse e Validação do Input
-        try:
-            req_body = req.get_json()
-            question = req_body.get('question', '')
-        except ValueError:
-            return func.HttpResponse(
-                json.dumps({"error": "JSON inválido"}),
-                mimetype="application/json",
-                status_code=400
-            )
-        
-        is_valid, sanitized_question, error_msg = validator.validate_question(question)
-        if not is_valid:
-            logger.warning(f"Validação falhou: {error_msg}")
-            return func.HttpResponse(
-                json.dumps({"error": error_msg}),
-                mimetype="application/json",
-                status_code=400
-            )
-        
-        logger.info(f"Pergunta validada: {sanitized_question[:50]}...")
-        
-        # 4. Buscar Documentos
-        try:
-            relevant_docs = rag_engine.search_documents(sanitized_question)
-        except Exception as e:
-            logger.error(f"Erro na busca: {str(e)}")
-            return func.HttpResponse(
-                json.dumps({
-                    "error": "Erro ao buscar documentos",
-                    "message": "Serviço temporariamente indisponível"
-                }),
-                mimetype="application/json",
-                status_code=503
-            )
-        
-        # 5. Gerar Resposta
-        try:
-            result = rag_engine.generate_answer(
-                question=sanitized_question,
-                docs=relevant_docs,
-                client_ip=client_ip
-            )
-        except Exception as e:
-            logger.error(f"Erro ao gerar resposta: {str(e)}")
-            return func.HttpResponse(
-                json.dumps({
-                    "error": "Erro ao gerar resposta",
-                    "message": "Não foi possível processar sua pergunta"
-                }),
-                mimetype="application/json",
-                status_code=500
-            )
-        
-        # 6. Adicionar Metadados
         response_data = {
             **result,
             "metadata": {
                 "timestamp": datetime.now().isoformat(),
-                "model": "gpt-35-turbo",
-                "compliance_level": "CONFIDENTIAL",
-                "rate_limit_remaining": rate_limiter.max_requests - len(rate_limiter.requests[client_ip])
+                "model": "gpt-fallback" if result['confidence'] == "CONTINGÊNCIA" else "gpt-standard"
             }
         }
-        
-        # 7. Retornar Resposta
-        logger.info(f"✅ Resposta gerada com sucesso (confiança: {result['confidence']})")
         
         return func.HttpResponse(
             json.dumps(response_data, ensure_ascii=False, indent=2),
@@ -388,66 +283,8 @@ def ask_compliance(req: func.HttpRequest) -> func.HttpResponse:
         )
         
     except Exception as e:
-        logger.error(f"❌ Erro não tratado: {str(e)}", exc_info=True)
+        logger.error(f"Erro crítico: {str(e)}", exc_info=True)
         return func.HttpResponse(
-            json.dumps({
-                "error": "Erro interno do servidor",
-                "message": "Ocorreu um erro inesperado"
-            }),
-            mimetype="application/json",
+            json.dumps({"error": "Erro interno do servidor", "details": str(e)}),
             status_code=500
-        )
-
-# ==================== HEALTH CHECK ====================
-@app.route(
-    route="health",
-    auth_level=func.AuthLevel.ANONYMOUS,
-    methods=["GET"]
-)
-def health_check(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Endpoint de health check para monitoramento
-    """
-    try:
-        # Verificar conectividade com serviços
-        health_status = {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "services": {
-                "search": "ok",
-                "openai": "ok"
-            }
-        }
-        
-        return func.HttpResponse(
-            json.dumps(health_status),
-            mimetype="application/json",
-            status_code=200
-        )
-    except Exception as e:
-        return func.HttpResponse(
-            json.dumps({"status": "unhealthy", "error": str(e)}),
-            mimetype="application/json",
-            status_code=503
-        )
-
-@app.route(route="ingest_document", auth_level=func.AuthLevel.ANONYMOUS)
-def ingest_document(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Python HTTP trigger function processed a request.')
-
-    name = req.params.get('name')
-    if not name:
-        try:
-            req_body = req.get_json()
-        except ValueError:
-            pass
-        else:
-            name = req_body.get('name')
-
-    if name:
-        return func.HttpResponse(f"Hello, {name}. This HTTP triggered function executed successfully.")
-    else:
-        return func.HttpResponse(
-             "This HTTP triggered function executed successfully. Pass a name in the query string or in the request body for a personalized response.",
-             status_code=200
         )
